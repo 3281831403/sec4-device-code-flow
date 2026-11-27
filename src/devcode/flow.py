@@ -69,10 +69,7 @@ def _poll_interval(policy: dict) -> int:
 
 def _device_code_length(policy: dict) -> int:
     """Return how many characters an issued device code should have."""
-    configured = policy.get("device_length") if isinstance(policy, dict) else None
-    if isinstance(configured, int) and not isinstance(configured, bool) and configured > 0:
-        return configured
-    return 8
+    return _positive_int(policy, "device_code_length", DEFAULT_POLICY["device_code_length"])
 
 
 def _user_code_length(policy: dict) -> int:
@@ -103,7 +100,7 @@ def _b32(data: bytes, length: int) -> str:
 def _normalize_user_code(code) -> str:
     if not isinstance(code, str):
         return ""
-    return code.strip()
+    return code.strip().upper()
 
 
 def _failure(reason: str, **fields) -> dict:
@@ -124,6 +121,9 @@ def _failure(reason: str, **fields) -> dict:
 
 def _record_failed_attempt(record: dict) -> None:
     record["attempts"] = int(record.get("attempts", 0)) + 1
+    limit = record.get("max_attempts")
+    if isinstance(limit, int) and limit > 0 and record["attempts"] >= limit:
+        record["status"] = "invalidated"
 
 
 def issue(store: dict, entropy, now: int, policy: dict) -> dict:
@@ -147,16 +147,23 @@ def issue(store: dict, entropy, now: int, policy: dict) -> dict:
 
     device_seed = (
         b"device-code:"
+        + material
+        + b":"
         + str(now).encode("ascii")
         + b":"
         + str(sequence).encode("ascii")
-        + b":"
-        + str(len(material)).encode("ascii")
     )
     device_digest = hashlib.sha256(device_seed).digest()
     device_code = _b32(device_digest, _device_code_length(policy))
 
-    user_seed = b"user-code:" + str(now).encode("ascii")
+    user_seed = (
+        b"user-code:"
+        + material
+        + b":"
+        + str(now).encode("ascii")
+        + b":"
+        + str(sequence).encode("ascii")
+    )
     user_digest = hashlib.sha256(user_seed).digest()
     user_code = _b32(user_digest, _user_code_length(policy))
 
@@ -213,14 +220,14 @@ def check_user_code(attempts, policy: dict) -> bool:
     if attempts < 0:
         return False
     limit = _max_attempts(policy)
-    return attempts <= limit
+    return attempts < limit
 
 
 def check_polling(interval, policy: dict) -> bool:
     """Return True when the delay between polls is acceptable."""
     if isinstance(interval, bool) or not isinstance(interval, (int, float)):
         return False
-    return interval >= 0
+    return interval >= _poll_interval(policy)
 
 
 def authorize(store: dict, user_code, account, now: int) -> dict:
@@ -248,6 +255,32 @@ def authorize(store: dict, user_code, account, now: int) -> dict:
             device_code=device_code,
             status=record.get("status"),
             expires_at=record.get("expires_at"),
+            poll_interval=record.get("poll_interval"),
+        )
+
+    expires_at = record.get("expires_at")
+    if isinstance(expires_at, int) and now >= expires_at:
+        record["status"] = "expired"
+        return _failure(
+            "user code has expired",
+            device_code=device_code,
+            status="expired",
+            expires_at=expires_at,
+            poll_interval=record.get("poll_interval"),
+        )
+
+    limit = record.get("max_attempts")
+    if (
+        isinstance(limit, int)
+        and limit > 0
+        and int(record.get("attempts", 0)) >= limit
+    ):
+        record["status"] = "invalidated"
+        return _failure(
+            "too many failed attempts",
+            device_code=device_code,
+            status="invalidated",
+            expires_at=expires_at,
             poll_interval=record.get("poll_interval"),
         )
 
@@ -290,7 +323,24 @@ def exchange(store: dict, device_code, now: int) -> dict:
     if not isinstance(record, dict):
         return _failure("unknown device code", device_code=device_code if isinstance(device_code, str) else "")
 
-    if record.get("status") != "authorized":
+    interval = record.get("poll_interval")
+    last_poll_at = record.get("last_poll_at")
+    if (
+        isinstance(last_poll_at, int)
+        and isinstance(interval, int)
+        and interval > 0
+        and now - last_poll_at < interval
+    ):
+        return _failure(
+            "polling too quickly",
+            device_code=device_code,
+            status=record.get("status"),
+            expires_at=record.get("expires_at"),
+            poll_interval=interval,
+        )
+    record["last_poll_at"] = now
+
+    if record.get("used") or record.get("status") != "authorized":
         return _failure(
             "authorization is not complete",
             device_code=device_code,
@@ -299,10 +349,21 @@ def exchange(store: dict, device_code, now: int) -> dict:
             poll_interval=record.get("poll_interval"),
         )
 
+    expires_at = record.get("expires_at")
+    if isinstance(expires_at, int) and now >= expires_at:
+        record["status"] = "expired"
+        return _failure(
+            "device code has expired",
+            device_code=device_code,
+            status="expired",
+            expires_at=expires_at,
+            poll_interval=record.get("poll_interval"),
+        )
+
     token = secrets.token_urlsafe(32)
     record["token"] = token
     record["used"] = True
-    record["last_poll_at"] = now
+    record["status"] = "used"
     store["tokens"][token] = {
         "device_code": device_code,
         "account": record.get("account", ""),
@@ -335,6 +396,37 @@ def validate_policy(policy: dict) -> list[str]:
     if not isinstance(expiry, int) or isinstance(expiry, bool) or expiry <= 0:
         problems.append("expires_in is required")
 
+    length = policy.get("device_code_length")
+    if not isinstance(length, int) or isinstance(length, bool) or length <= 0:
+        problems.append("device_code_length is required")
+
+    entropy_bits = policy.get("device_code_entropy_bits")
+    if not isinstance(entropy_bits, int) or isinstance(entropy_bits, bool) or entropy_bits <= 0:
+        problems.append("device_code_entropy_bits is required")
+
+    max_length = policy.get("device_code_max_length")
+    if not isinstance(max_length, int) or isinstance(max_length, bool) or max_length <= 0:
+        problems.append("device_code_max_length is required")
+
+    user_code_length = policy.get("user_code_length")
+    if not isinstance(user_code_length, int) or isinstance(user_code_length, bool) or user_code_length <= 0:
+        problems.append("user_code_length is required")
+
+    max_attempts = policy.get("max_attempts")
+    if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts <= 0:
+        problems.append("max_attempts is required")
+
+    if (
+        isinstance(length, int)
+        and not isinstance(length, bool)
+        and length > 0
+        and isinstance(max_length, int)
+        and not isinstance(max_length, bool)
+        and max_length > 0
+        and max_length < length
+    ):
+        problems.append("device_code_max_length must be at least device_code_length")
+
     return problems
 
 
@@ -349,7 +441,6 @@ def device_batch(requests: list[dict], store: dict, now: int) -> dict:
         raise TypeError("requests must be a list")
 
     results: list[dict] = []
-    shared_code = None
 
     for index, request in enumerate(requests):
         request_id = index
@@ -362,10 +453,6 @@ def device_batch(requests: list[dict], store: dict, now: int) -> dict:
             if not isinstance(policy, dict):
                 policy = {}
             issued = issue(store, request.get("entropy", b""), now, policy)
-            if shared_code is None:
-                shared_code = issued["device_code"]
-            else:
-                issued["device_code"] = shared_code
             results.append(
                 {
                     "request_id": request_id,
